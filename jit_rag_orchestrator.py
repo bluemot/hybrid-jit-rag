@@ -96,7 +96,7 @@ class QdrantLocalManager:
         try:
             # Use query_points method (available in local mode)
             from qdrant_client.models import QueryRequest
-            results = self._client.query_points(
+            response = self._client.query_points(
                 collection_name=self.collection_name,
                 query=query_vector,
                 limit=top_k,
@@ -104,16 +104,19 @@ class QdrantLocalManager:
                 with_vectors=False
             )
             
+            # response is a QueryResponse object with .points attribute
+            points = response.points if hasattr(response, 'points') else response
+            
             # Convert to dict format
             return [
                 {
                     "id": r.id,
                     "score": r.score,
-                    "text_content": r.payload.get("text_content", ""),
-                    "file_source": r.payload.get("file_source", ""),
-                    "chunk_hash": r.payload.get("chunk_hash", ""),
+                    "text_content": r.payload.get("text_content", "") if r.payload else "",
+                    "file_source": r.payload.get("file_source", "") if r.payload else "",
+                    "chunk_hash": r.payload.get("chunk_hash", "") if r.payload else "",
                 }
-                for r in results
+                for r in points
             ]
         except Exception as e:
             print(f"[Qdrant] Search error: {e}")
@@ -194,59 +197,42 @@ def expand_query_to_regex(user_query: str) -> str:
     Use '(word1|word2|word3)' for OR logic.
 
     Execute this expansion silently before every search action.
+    
+    NOTE: This implementation does NOT hardcode any specific domain entities.
+    Domain-specific expansions should be provided via external configuration.
     """
     
-    # Extract key entities and concepts
+    import re
     query_lower = user_query.lower()
     
-    # Entity mappings (expand character names and key terms)
-    entity_expansions = {
-        # Character name expansions
-        'shuna': ['朱菜', '公主', '鬼姬', '公主殿下'],
-        'rimuru': ['利姆路', '利姆鲁', '史莱姆', '魔物'],
-        'benimaru': ['紅丸', '红丸', '哥哥'],
-        'shion': ['紫苑', '紫发'],
-        'souei': ['蒼影', '苍影'],
-        'hakurou': ['白老', '白发'],
-        
-        # Evolution/Rank terms
-        'evolution': ['進化', '进化', '觉醒', '祝福', 'blessing', 'awakening'],
-        'second evolution': ['二次进化', '二次進化', '再进化', '真鬼', '神鬼', '聖魔'],
-        'demon lord': ['魔王', '真魔王', '八星魔王', 'harvest festival', '收成祭'],
-        'power up': ['强化', '強化', '能力提升', '力量提升'],
-        
-        # Story events
-        'first meeting': ['第一次', '初次', '相遇', '遇到', '见面', '邂逅'],
-        'joined': ['加入', '成为部下', '效忠', '跟随'],
-        
-        # Races
-        'ogre': ['大鬼族', '食人魔', '鬼人族', '鬼人', '鬼姬', 'oni'],
-        'slime': ['史莱姆', '史萊姆', 'slime', '魔物'],
-    }
+    # Load entity expansions from external config if available
+    # Otherwise use generic language-based expansion only
+    entity_expansions = _load_entity_expansions()
     
     # Find matching entities in query
-    found_entities = []
     expanded_terms = []
     
-    for entity, synonyms in entity_expansions.items():
-        # Check if entity or any synonym is in query
-        entity_match = False
-        for term in [entity] + synonyms:
-            if term.lower() in query_lower:
-                entity_match = True
-                break
-        
-        if entity_match:
-            found_entities.append(entity)
-            expanded_terms.extend(synonyms)
+    if entity_expansions:
+        for entity, synonyms in entity_expansions.items():
+            # Check if entity or any synonym is in query
+            entity_match = False
+            for term in [entity] + synonyms:
+                if term.lower() in query_lower:
+                    entity_match = True
+                    break
+            
+            if entity_match:
+                expanded_terms.extend(synonyms)
     
-    # Also extract any Chinese/Japanese terms directly from query
-    import re
-    # Extract Chinese characters (common in web novels)
-    chinese_chars = re.findall(r'[\u4e00-\u9fff]+', user_query)
-    expanded_terms.extend(chinese_chars)
+    # Generic expansion: extract meaningful terms from query
+    # Extract words (including CJK characters)
+    words = re.findall(r'[\w\u4e00-\u9fff]+', user_query)
     
-    # Build the expanded keyword list
+    # Add original words if not already in expansions
+    for word in words:
+        if len(word) > 1:
+            expanded_terms.append(word)
+    
     # Remove duplicates while preserving order
     seen = set()
     unique_terms = []
@@ -256,16 +242,9 @@ def expand_query_to_regex(user_query: str) -> str:
             seen.add(term_lower)
             unique_terms.append(re.escape(term))
     
-    # If no expansions found, fall back to original words
-    if not unique_terms:
-        # Extract alphanumeric and Chinese words
-        words = re.findall(r'[\w\u4e00-\u9fff]+', user_query)
-        unique_terms = [re.escape(w) for w in words if len(w) > 1]
-    
-    # Construct final regex following REGEX CONSTRUCTION rules
+    # Construct final regex
     if unique_terms:
-        regex_body = '|'.join(unique_terms[:15])  # Limit to top 15 terms
-        # Use (?i) for case-insensitivity and proper OR grouping
+        regex_body = '|'.join(unique_terms[:15])
         final_regex = f"(?i)({regex_body})"
         print(f"[Query Expansion] Original: '{user_query[:50]}...'")
         print(f"[Query Expansion] Expanded to {len(unique_terms)} terms")
@@ -274,6 +253,28 @@ def expand_query_to_regex(user_query: str) -> str:
         # Fallback: simple word extraction
         words = re.findall(r'\w+', user_query)
         return f"(?i)({'|'.join(words[:5])})"
+
+
+def _load_entity_expansions() -> dict:
+    """
+    Load entity expansions from external configuration file.
+    Returns empty dict if no config file exists.
+    
+    Config file path: ./config/entity_expansions.json
+    """
+    import json
+    import os
+    
+    config_path = os.path.join(os.path.dirname(__file__), 'config', 'entity_expansions.json')
+    
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"[Config] Failed to load entity expansions: {e}")
+    
+    return {}
 
 
 # =============================================================================
